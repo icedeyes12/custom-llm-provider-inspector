@@ -1,0 +1,36 @@
+# Bytecode / caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Local Python version
+.python-version
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*~
+
+# Runtime
+reports/
+*.log

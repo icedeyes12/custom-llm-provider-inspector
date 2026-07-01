@@ -1,0 +1,14 @@
+[project]
+name = "provider-inspector"
+version = "0.1.0"
+description = "Inspect, probe, benchmark, and analyze OpenAI-compatible API providers"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "rich>=13.0",
+    "requests>=2.31",
+]
+
+[project.scripts]
+provider-inspector = "main:main"
+
