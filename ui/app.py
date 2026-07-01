@@ -21,6 +21,7 @@ class Screen(Enum):
     BROWSE_MODELS = auto()
     MODEL_DETAIL = auto()
     FULL_SCAN = auto()
+    SCAN_SUMMARY = auto()
     SCAN_RESULTS = auto()
     REPORTS = auto()
     SETTINGS = auto()

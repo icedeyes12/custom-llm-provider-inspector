@@ -1,8 +1,8 @@
-"""Screen renderers — cohesive terminal UX.
+"""Screen renderers for Provider Inspector.
 
-Navigation contract:
-  9 = Back,  0 = Exit  (every screen)
-  Main menu: 9 = Disconnect, 0 = Exit
+Navigation:
+  b = Back
+  q = Quit
 """
 
 from __future__ import annotations
@@ -13,19 +13,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
+from rich import box
 from rich.align import Align
+from rich.live import Live
 from rich.panel import Panel
-from rich.progress import (
-    BarColumn,
-    Progress,
-    SpinnerColumn,
-    TaskProgressColumn,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
 from rich.prompt import Prompt
 from rich.table import Table
+from rich.text import Text
 
 from core.benchmark import (
     test_chat,
@@ -35,7 +29,7 @@ from core.benchmark import (
     test_vision,
 )
 from core.env import has_env_file, resolve_url_key_pair
-from core.models import CapabilityScan
+from core.models import CapabilityScan, ChatResult, JsonModeResult, ModelInfo, StreamResult, ToolCallResult, VisionResult
 from core.scanner import detect_provider
 from core.session import session
 from ui.app import Screen
@@ -44,14 +38,8 @@ from ui.theme import SPINNER_STYLE
 if TYPE_CHECKING:
     from ui.app import ProviderInspectorApp
 
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-NAV_BACK = 9
-NAV_EXIT = 0
 REPORTS_DIR = Path("reports")
-MODEL_ID_MAX = 22
+MODEL_ID_MAX = 24
 
 SINGLE_TESTS = [
     ("Chat", "test_chat"),
@@ -61,64 +49,94 @@ SINGLE_TESTS = [
     ("JSON Mode", "test_json_mode"),
 ]
 
-
-# ---------------------------------------------------------------------------
-# Shared helpers
-# ---------------------------------------------------------------------------
-
-
-def _truncate(s: str, max_len: int = MODEL_ID_MAX) -> str:
-    if len(s) <= max_len:
-        return s
-    return s[: max_len - 2] + ".."
+CAPABILITY_LABELS = [
+    ("Chat", "chat"),
+    ("Stream", "streaming"),
+    ("Tools", "tools"),
+    ("Vision", "vision"),
+    ("JSON", "json_mode"),
+]
 
 
-def _ask(valid: set[int] | None = None) -> int:
-    """Universal `>` prompt — no choices shown, no default."""
+def _truncate(text: str, max_len: int) -> str:
+    if max_len <= 1:
+        return text[:max_len]
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 1] + "…"
+
+
+def _format_duration(ms: float | None) -> str:
+    if ms is None:
+        return ""
+    seconds = int(round(ms / 1000.0))
+    minutes, seconds = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def _format_ms(ms: float | None) -> str:
+    if ms is None:
+        return ""
+    return f"{ms:.0f}ms"
+
+
+def _set_console(console) -> None:
+    _ask._console = console  # type: ignore[attr-defined]
+
+
+def _ask(valid: set[int] | None = None) -> int | str:
     while True:
-        raw = Prompt.ask("  >")
-        raw = raw.strip()
+        raw = Prompt.ask("  >").strip().lower()
         if not raw:
             continue
+        if raw in {"b", "q"}:
+            return raw
         try:
-            val = int(raw)
+            value = int(raw)
         except ValueError:
-            app_console = _ask._console  # type: ignore[attr-defined]
-            if app_console:
-                app_console.print("  [dim]?[/]")
+            console = getattr(_ask, "_console", None)
+            if console:
+                console.print("  [dim]?[/]")
             continue
-        if valid is not None and val not in valid:
-            app_console = _ask._console  # type: ignore[attr-defined]
-            if app_console:
-                app_console.print("  [dim]?[/]")
+        if valid is not None and value not in valid:
+            console = getattr(_ask, "_console", None)
+            if console:
+                console.print("  [dim]?[/]")
             continue
-        return val
+        return value
 
 
 def _nav(console, back_label: str = "Back") -> None:
-    """Standard nav footer."""
     console.print()
     console.rule(style="dim")
-    console.print(f"  [bold]9.[/] {back_label}    [bold]0.[/] Exit")
+    console.print(f"  [bold]b[/] {back_label}    [bold]q[/] Quit")
 
 
 def _provider_header(console) -> None:
-    """One-line header — provider name, status, model count, base URL."""
     provider = detect_provider(session.base_url) or "Custom"
     short = provider.split("(")[0].strip()
     host = session.base_url.replace("https://", "").replace("http://", "").split("/")[0]
     console.print()
-    console.print(f"  [bold]{short}[/]  [dim]Connected · {len(session.models)} models · {host}[/]")
+    header = Text()
+    header.append(short, style="bold")
+    header.append("  ")
+    header.append("Connected", style="muted")
+    if session.models:
+        header.append(f" · {len(session.models)} models", style="muted")
+    if host:
+        header.append(f" · {host}", style="muted")
+    console.print(header)
+
+
+def _ensure_reports_dir() -> None:
+    REPORTS_DIR.mkdir(exist_ok=True)
 
 
 def _auto_filename(extension: str = "json") -> str:
     ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     return f"provider_scan_{ts}.{extension}"
-
-
-def _ensure_reports_dir() -> Path:
-    REPORTS_DIR.mkdir(exist_ok=True)
-    return REPORTS_DIR
 
 
 def _save_report(data: object, fmt: str = "json") -> str:
@@ -139,16 +157,18 @@ def _save_csv(scans: list[CapabilityScan], path: Path) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["model", "chat", "streaming", "tools", "vision", "json_mode", "latency_ms"])
-        for s in scans:
-            writer.writerow([
-                s.model_id,
-                "Y" if s.chat.latency.ok and s.chat.content else "N",
-                "Y" if s.streaming.first_token_ms is not None and not s.streaming.error else "N",
-                "Y" if s.tools.supported else "N",
-                "Y" if s.vision.supported else "N",
-                "Y" if s.json_mode.supported else "N",
-                f"{s.chat.latency.total_ms:.0f}" if s.chat.latency.ok else "",
-            ])
+        for scan in scans:
+            writer.writerow(
+                [
+                    scan.model_id,
+                    "Y" if scan.chat.latency.ok and scan.chat.content else "N",
+                    "Y" if scan.streaming.first_token_ms is not None and not scan.streaming.error else "N",
+                    "Y" if scan.tools.supported else "N",
+                    "Y" if scan.vision.supported else "N",
+                    "Y" if scan.json_mode.supported else "N",
+                    f"{scan.chat.latency.total_ms:.0f}" if scan.chat.latency.ok else "",
+                ]
+            )
 
 
 def _list_saved_reports() -> list[Path]:
@@ -157,234 +177,231 @@ def _list_saved_reports() -> list[Path]:
     return sorted(REPORTS_DIR.iterdir(), reverse=True)
 
 
-def _set_console(console) -> None:
-    """Stash console ref for _ask feedback."""
-    _ask._console = console  # type: ignore[attr-defined]
-
-
-# ---------------------------------------------------------------------------
-# Splash
-# ---------------------------------------------------------------------------
-
-
-def _splash(app: ProviderInspectorApp) -> str:
-    _set_console(app.console)
-
-    app.console.print()
-    app.console.print()
-    app.console.print(Align.center("[bold bright_white]CUSTOM PROVIDER INSPECTOR[/]"))
-    app.console.print(Align.center("[dim]Inspect · Probe · Benchmark[/]"))
-    app.console.print()
-    app.console.rule(style="bright_blue")
-    app.console.print()
-    app.console.print(Align.center("[dim]crafted by icedeyes12[/]"))
-    app.console.print(Align.center("[dim]co-developed with ฅReina ฅ^•ﻌ•^ฅ[/]"))
-    app.console.print(
-        Align.center("[link=https://github.com/icedeyes12/provider-inspector][dim]github.com/icedeyes12/provider-inspector[/][/]")
-    )
-    app.console.print()
-    # Auto-advance — no Enter needed
-    return "connect"
-
-
-# ---------------------------------------------------------------------------
-# Connection
-# ---------------------------------------------------------------------------
-
-
-def _connection(app: ProviderInspectorApp) -> str:
-    _set_console(app.console)
-    app.console.print()
-    app.console.rule("[bold]Connect[/bold]")
-    app.console.print()
-
-    if has_env_file():
-        app.console.print("  [dim]Enter a Base URL or env var ending _URL[/]")
-        app.console.print("  [dim]e.g. OPENAI_URL  PROVIDER_URL  TEST_URL[/]")
-        app.console.print()
-
-    base_url_raw = Prompt.ask("  [accent]Base URL[/]")
-    if base_url_raw.strip().lower() in ("0", "exit", "q"):
-        return "exit"
-
-    base_url, auto_key = resolve_url_key_pair(base_url_raw)
-
-    if base_url != base_url_raw:
-        app.console.print("  [success]✓ resolved URL[/]")
-
-    if auto_key:
-        api_key = auto_key
-        suffix = api_key[-4:] if len(api_key) >= 4 else "****"
-        app.console.print(f"  [success]✓ auto-resolved key[/]  [dim]{'*' * 8}{suffix}[/]")
-    else:
-        api_key_raw = Prompt.ask("  [accent]API Key[/]", password=True)
-        if api_key_raw.strip().lower() in ("0", "exit", "q"):
-            return "exit"
-        from core.env import resolve_env
-        api_key = resolve_env(api_key_raw)
-        if api_key != api_key_raw:
-            app.console.print("  [success]✓ resolved key[/]")
-
-    if not base_url or not api_key:
-        app.console.print(Panel("[error]Both Base URL and API key are required.[/]", border_style="red"))
-        _nav(app.console, "Retry")
-        choice = _ask({NAV_BACK, NAV_EXIT})
-        if choice == NAV_EXIT:
-            return "exit"
-        return "connect"
-
-    app.console.print()
-    with app.console.status("Connecting…", spinner=SPINNER_STYLE):
-        ok = app.connect(base_url, api_key)
-
-    if ok:
-        return "main_menu"
-    return "error"
-
-
-# ---------------------------------------------------------------------------
-# Error
-# ---------------------------------------------------------------------------
-
-
-def _error(app: ProviderInspectorApp) -> str:
-    app.console.print()
-    app.console.print(Panel(
-        app.last_error_friendly,
-        title=app.last_error_title,
-        border_style="red",
-    ))
-    _nav(app.console, "Retry")
-    choice = _ask({NAV_BACK, NAV_EXIT})
-    if choice == NAV_EXIT:
-        return "exit"
-    return "connect"
-
-
-# ---------------------------------------------------------------------------
-# Main menu
-# ---------------------------------------------------------------------------
-
-
-def _main_menu(app: ProviderInspectorApp) -> str | None:
-    _set_console(app.console)
-    _provider_header(app.console)
-
-    items: list[tuple[str, str]] = [
-        ("Browse Models", "browse_models"),
-        ("Full Capability Scan", "full_scan"),
-    ]
-    if app.scan_results:
-        items.append(("Scan Results", "scan_results"))
-    items.append(("Reports", "reports"))
-    items.append(("Settings", "settings"))
-
-    app.console.print()
-    for i, (label, _) in enumerate(items, 1):
-        app.console.print(f"  [bold]{i}.[/] {label}")
-
-    _nav(app.console, "Disconnect")
-
-    valid = set(range(1, len(items) + 1)) | {NAV_BACK, NAV_EXIT}
-    choice = _ask(valid)
-
-    if choice == NAV_EXIT:
-        return "exit"
-    if choice == NAV_BACK:
-        return "disconnect"
-    if 1 <= choice <= len(items):
-        return items[choice - 1][1]
+def _model_scan_for(model_id: str) -> CapabilityScan | None:
+    for scan in session.scan_results:
+        if scan.model_id == model_id:
+            return scan
     return None
 
 
-# ---------------------------------------------------------------------------
-# Browse models
-# ---------------------------------------------------------------------------
+def _capability_ok(value) -> bool:
+    if isinstance(value, ChatResult):
+        return value.latency.ok and bool(value.content)
+    if isinstance(value, StreamResult):
+        return value.first_token_ms is not None and not value.error
+    if isinstance(value, ToolCallResult):
+        return value.supported
+    if isinstance(value, VisionResult):
+        return value.supported
+    if isinstance(value, JsonModeResult):
+        return value.supported
+    return False
 
 
-def _browse_models(app: ProviderInspectorApp) -> str:
-    _set_console(app.console)
+def _result_reason(value) -> str:
+    if isinstance(value, ChatResult):
+        if value.latency.error:
+            return value.latency.error
+        if value.latency.status_code >= 400:
+            return f"HTTP {value.latency.status_code}"
+        if not value.content:
+            return "Empty response"
+        return ""
+    if isinstance(value, StreamResult):
+        if value.error:
+            return value.error
+        if value.status_code >= 400:
+            return f"HTTP {value.status_code}"
+        return "No stream output"
+    if isinstance(value, ToolCallResult):
+        if value.error:
+            return value.error
+        return "Tool calls not returned"
+    if isinstance(value, VisionResult):
+        if value.error:
+            return value.error
+        return "Image handling rejected"
+    if isinstance(value, JsonModeResult):
+        if value.error:
+            return value.error
+        if not value.parsed_json:
+            return "Returned non-JSON text"
+        return ""
+    return ""
+
+
+def _primary_latency(scan: CapabilityScan) -> float | None:
+    candidates = [
+        scan.chat.latency.total_ms if scan.chat.latency.ok else None,
+        scan.streaming.total_ms if scan.streaming.first_token_ms is not None and not scan.streaming.error else None,
+        scan.tools.latency.total_ms if scan.tools.latency.ok else None,
+        scan.vision.latency.total_ms if scan.vision.latency.ok else None,
+        scan.json_mode.latency.total_ms if scan.json_mode.latency.ok else None,
+    ]
+    for candidate in candidates:
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def _scan_status(scan: CapabilityScan) -> tuple[str, str]:
+    passes = [
+        _capability_ok(scan.chat),
+        _capability_ok(scan.streaming),
+        _capability_ok(scan.tools),
+        _capability_ok(scan.vision),
+        _capability_ok(scan.json_mode),
+    ]
+    count = sum(1 for item in passes if item)
+    if count == 5:
+        return ("OK", "status.ok")
+    if count == 0:
+        return ("FAILED", "status.fail")
+    return ("PARTIAL", "status.partial")
+
+
+def _capability_summary(scan: CapabilityScan) -> str:
+    enabled: list[str] = []
+    if _capability_ok(scan.chat):
+        enabled.append("Chat")
+    if _capability_ok(scan.streaming):
+        enabled.append("Stream")
+    if _capability_ok(scan.tools):
+        enabled.append("Tools")
+    if _capability_ok(scan.vision):
+        enabled.append("Vision")
+    if _capability_ok(scan.json_mode):
+        enabled.append("JSON")
+    return " ".join(enabled)
+
+
+def _failure_reason(scan: CapabilityScan) -> str:
+    for label, field in CAPABILITY_LABELS:
+        result = getattr(scan, field)
+        if not _capability_ok(result):
+            reason = _result_reason(result)
+            if reason:
+                return f"{label}: {_truncate(reason, 64)}"
+            return label
+    return ""
+
+
+def _status_style(status: str) -> str:
+    if status == "OK":
+        return "status.ok"
+    if status == "FAILED":
+        return "status.fail"
+    return "status.partial"
+
+
+def _render_scan_progress(model: str, capability: str, done: int, total: int, elapsed_ms: float, console_width: int) -> Panel:
+    inner_width = max(30, console_width - 6)
+    model_width = max(18, inner_width - 10)
+    cap_width = max(10, inner_width - 12)
+    model_value = _truncate(model, model_width)
+    cap_value = _truncate(capability, cap_width)
+    progress_value = f"{done}/{total} ({(done / total * 100):.0f}%)" if total else "0/0"
+    elapsed_value = _format_duration(elapsed_ms)
+
+    body = Text()
+    body.append("Model: ", style="muted")
+    body.append(model_value, style="bold")
+    body.append("\n")
+    body.append("Capability: ", style="muted")
+    body.append(cap_value)
+    body.append("\n")
+    body.append("Progress: ", style="muted")
+    body.append(progress_value)
+    body.append("\n")
+    body.append("Elapsed: ", style="muted")
+    body.append(elapsed_value)
+
+    return Panel.fit(body, title="Scanning", border_style="panel.border")
+
+
+def _render_scan_table(results: list[CapabilityScan], title: str = "Results") -> Table:
+    tbl = Table(show_header=True, header_style="table.header", title=title, box=box.SIMPLE, expand=True)
+    tbl.add_column("#", style="dim", justify="right", width=4)
+    tbl.add_column("Model", style="bold magenta", max_width=MODEL_ID_MAX, no_wrap=True, overflow="ellipsis")
+    tbl.add_column("Status", justify="center", width=10)
+    tbl.add_column("Latency", justify="right", width=10)
+    tbl.add_column("Capabilities", max_width=24, overflow="ellipsis")
+
+    for idx, scan in enumerate(results, 1):
+        status, status_style = _scan_status(scan)
+        latency = _format_ms(_primary_latency(scan))
+        caps = _capability_summary(scan)
+        tbl.add_row(
+            str(idx),
+            scan.model_id,
+            f"[{status_style}]{status}[/{status_style}]",
+            latency,
+            caps,
+        )
+    return tbl
+
+
+def _render_model_detail(app: ProviderInspectorApp, model: ModelInfo, scan: CapabilityScan | None) -> list[object]:
+    blocks: list[object] = []
+
+    overview = Table.grid(padding=(0, 1))
+    overview.add_column(style="muted", no_wrap=True)
+    overview.add_column()
+    overview.add_row("Model", f"[bold]{model.id}[/]")
+    if scan is not None:
+        status, status_style = _scan_status(scan)
+        overview.add_row("Status", f"[{status_style}]{status}[/{status_style}]")
+        latency = _format_ms(_primary_latency(scan))
+        if latency:
+            overview.add_row("Latency", latency)
+    if model.owner:
+        overview.add_row("Owner", model.owner)
+    if model.created:
+        overview.add_row("Created", datetime.fromtimestamp(model.created).strftime("%Y-%m-%d %H:%M"))
+    blocks.append(Panel(overview, title="Model", border_style="panel.border"))
+
+    if scan is not None:
+        cap_tbl = Table(show_header=True, header_style="table.header", box=box.SIMPLE, expand=True)
+        cap_tbl.add_column("Capability", style="bold", max_width=12, no_wrap=True)
+        cap_tbl.add_column("Result", justify="center", width=10)
+        cap_tbl.add_column("Reason", overflow="ellipsis")
+
+        capability_rows = [
+            ("Chat", scan.chat),
+            ("Stream", scan.streaming),
+            ("Tools", scan.tools),
+            ("Vision", scan.vision),
+            ("JSON", scan.json_mode),
+        ]
+        for label, result in capability_rows:
+            ok = _capability_ok(result)
+            style = "status.ok" if ok else "status.fail"
+            reason = _result_reason(result)
+            cap_tbl.add_row(label, f"[{style}]{'PASS' if ok else 'FAIL'}[/{style}]", reason)
+        blocks.append(cap_tbl)
+    else:
+        blocks.append(Panel("Run a full scan to see capability results.", border_style="panel.border"))
+
+    meta = Table.grid(padding=(0, 1))
+    meta.add_column(style="muted", no_wrap=True)
+    meta.add_column()
+    provider = detect_provider(session.base_url)
+    if provider:
+        meta.add_row("Provider", provider)
+    if session.base_url:
+        meta.add_row("Base URL", session.base_url)
+    raw_keys = sorted(model.raw.keys())
+    if raw_keys:
+        meta.add_row("Raw fields", str(len(raw_keys)))
+    blocks.append(Panel(meta, title="Provider Metadata", border_style="panel.border"))
+
+    return blocks
+
+
+def _model_result_menu(app: ProviderInspectorApp) -> None:
     app.console.print()
-    app.console.rule("[bold]Browse Models[/bold]")
-
-    if not session.models:
-        app.console.print("\n  [warning]No models loaded.[/]")
-        _nav(app.console)
-        choice = _ask({NAV_BACK, NAV_EXIT})
-        if choice == NAV_EXIT:
-            return "exit"
-        return "back"
-
-    tbl = Table(show_header=True, header_style="table.header")
-    tbl.add_column("#", style="dim white", justify="right", width=4)
-    tbl.add_column("Model ID", max_width=MODEL_ID_MAX, no_wrap=True, overflow="ellipsis")
-    tbl.add_column("Owner", style="dim white", max_width=16, no_wrap=True, overflow="ellipsis")
-    for i, m in enumerate(session.models, 1):
-        tbl.add_row(str(i), m.id, m.owner)
-    app.console.print(tbl)
-
-    _nav(app.console)
-    model_range = set(range(1, len(session.models) + 1))
-    choice = _ask(model_range | {NAV_BACK, NAV_EXIT})
-
-    if choice == NAV_EXIT:
-        return "exit"
-    if choice == NAV_BACK:
-        return "back"
-
-    app._selected_model_idx = choice - 1
-    return "model_detail"
-
-
-# ---------------------------------------------------------------------------
-# Model detail — accumulates results below menu
-# ---------------------------------------------------------------------------
-
-
-def _model_detail(app: ProviderInspectorApp) -> str:
-    _set_console(app.console)
-    idx = app._selected_model_idx
-    model = session.models[idx]
-    # Track test results for this model so we can accumulate
-    if not hasattr(app, "_model_results"):
-        app._model_results = {}  # type: ignore[attr-defined]
-    results_cache = app._model_results.setdefault(idx, [])
-
-    # Show header
-    app.console.print()
-    app.console.rule(f"[bold]{model.id}[/bold]")
-    app.console.print(f"  [dim]{model.owner}[/]")
-
-    # Show previous results (accumulated)
-    for kind, data in results_cache:
-        _display_single_result(app, kind, data)
-
-    app.console.print()
-    for i, (label, _) in enumerate(SINGLE_TESTS, 1):
-        app.console.print(f"  [bold]{i}.[/] {label}")
-
-    _nav(app.console)
-    test_range = set(range(1, len(SINGLE_TESTS) + 1))
-    choice = _ask(test_range | {NAV_BACK, NAV_EXIT})
-
-    if choice == NAV_EXIT:
-        return "exit"
-    if choice == NAV_BACK:
-        # Clear cache for this model when leaving
-        results_cache.clear()
-        return "back"
-
-    if not app.client:
-        app.console.print("\n  [error]Not connected.[/]")
-        return "model_detail"
-
-    action = SINGLE_TESTS[choice - 1][1]
-    with app.console.status(f"  Running {SINGLE_TESTS[choice - 1][0]}…", spinner=SPINNER_STYLE):
-        result = _run_single_test(app.client, model.id, action)
-
-    # Store result — will show on next render
-    results_cache.append(result)
-    return "model_detail"
+    for idx, (label, _) in enumerate(SINGLE_TESTS, 1):
+        app.console.print(f"  [bold]{idx}.[/] {label}")
 
 
 def _run_single_test(client, model_id: str, action: str):
@@ -405,57 +422,262 @@ def _run_single_test(client, model_id: str, action: str):
 
 def _display_single_result(app: ProviderInspectorApp, kind: str, data) -> None:
     if data is None:
-        app.console.print("\n  [error]Unknown test.[/]")
+        app.console.print(Panel("Unknown test.", border_style="red"))
         return
 
-    app.console.print()
-    tbl = Table(show_header=False, box=None, padding=(0, 2), title=f"[bold]{kind}[/]")
-    tbl.add_column("P", style="dim")
-    tbl.add_column("V")
+    tbl = Table(show_header=False, box=box.SIMPLE, padding=(0, 1), expand=True)
+    tbl.add_column("Field", style="muted", no_wrap=True, width=12)
+    tbl.add_column("Value")
 
     lat = getattr(data, "latency", None)
     if lat:
-        status = getattr(lat, "status_code", 0)
-        if status and status >= 400:
-            tbl.add_row("Status", f"[error]{status}[/]")
-        tbl.add_row("Latency", f"{getattr(lat, 'total_ms', 0):.0f}ms")
+        if getattr(lat, "status_code", 0) >= 400:
+            tbl.add_row("Status", f"[error]{lat.status_code}[/]")
+        if getattr(lat, "total_ms", None) is not None:
+            tbl.add_row("Latency", _format_ms(lat.total_ms))
         if getattr(lat, "first_token_ms", None) is not None:
-            tbl.add_row("TTFT", f"{lat.first_token_ms:.0f}ms")
+            tbl.add_row("TTFT", _format_ms(lat.first_token_ms))
         if getattr(lat, "error", None):
             tbl.add_row("Error", f"[error]{lat.error}[/]")
 
     match kind:
         case "chat":
-            tbl.add_row("Content", (data.content or "")[:200])
-            tbl.add_row("Finish", data.finish_reason or "n/a")
+            if data.content:
+                tbl.add_row("Content", _truncate(data.content, 220))
+            if data.finish_reason:
+                tbl.add_row("Finish", data.finish_reason)
             if data.usage:
-                tbl.add_row("Tokens", f"in={data.usage.get('prompt_tokens', '?')} out={data.usage.get('completion_tokens', '?')}")
+                tbl.add_row(
+                    "Tokens",
+                    f"in={data.usage.get('prompt_tokens', 0)} out={data.usage.get('completion_tokens', 0)}",
+                )
         case "streaming":
             tbl.add_row("Chunks", str(data.chunks))
-            tbl.add_row("TTFT", f"{data.first_token_ms:.0f}ms" if data.first_token_ms else "n/a")
-            tbl.add_row("Total", f"{data.total_ms:.0f}ms")
             if data.error:
                 tbl.add_row("Error", f"[error]{data.error}[/]")
         case "tools":
             tbl.add_row("Supported", "[success]Yes[/]" if data.supported else "[error]No[/]")
             if data.tool_calls:
                 tbl.add_row("Calls", str(len(data.tool_calls)))
+            if data.error:
+                tbl.add_row("Error", f"[error]{data.error}[/]")
         case "vision":
             tbl.add_row("Supported", "[success]Yes[/]" if data.supported else "[error]No[/]")
             if data.response_text:
-                tbl.add_row("Response", data.response_text[:200])
+                tbl.add_row("Response", _truncate(data.response_text, 220))
+            if data.error:
+                tbl.add_row("Error", f"[error]{data.error}[/]")
         case "json_mode":
             tbl.add_row("Supported", "[success]Yes[/]" if data.supported else "[error]No[/]")
             tbl.add_row("Parsed", "[success]Yes[/]" if getattr(data, "parsed_json", False) else "[error]No[/]")
             if data.response_text:
-                tbl.add_row("Response", data.response_text[:200])
+                tbl.add_row("Response", _truncate(data.response_text, 220))
+            if data.error:
+                tbl.add_row("Error", f"[error]{data.error}[/]")
 
+    app.console.print(Panel(tbl, title=kind.capitalize(), border_style="panel.border"))
+
+
+def _splash(app: ProviderInspectorApp) -> str:
+    _set_console(app.console)
+    app.console.print()
+    app.console.print()
+    app.console.print(Align.center("[bold bright_white]CUSTOM PROVIDER INSPECTOR[/]"))
+    app.console.print(Align.center("[dim]Inspect · Probe · Benchmark[/]"))
+    app.console.print()
+    app.console.rule(style="bright_blue")
+    app.console.print()
+    app.console.print(Align.center("[dim]crafted by icedeyes12[/]"))
+    app.console.print(Align.center("[dim]co-developed with ฅReina ฅ^•ﻌ•^ฅ[/]"))
+    app.console.print(
+        Align.center("[link=https://github.com/icedeyes12/provider-inspector][dim]github.com/icedeyes12/provider-inspector[/][/]")
+    )
+    app.console.print()
+    return "connect"
+
+
+def _connection(app: ProviderInspectorApp) -> str:
+    _set_console(app.console)
+    app.console.print()
+    app.console.rule("[bold]Connect[/bold]")
+    app.console.print()
+
+    if has_env_file():
+        app.console.print("  [dim]Enter a Base URL or env var ending _URL[/]")
+        app.console.print("  [dim]e.g. OPENAI_URL  PROVIDER_URL  TEST_URL[/]")
+        app.console.print()
+
+    base_url_raw = Prompt.ask("  [accent]Base URL[/]")
+    if base_url_raw.strip().lower() in {"b", "q"}:
+        return "exit"
+
+    base_url, auto_key = resolve_url_key_pair(base_url_raw)
+    if base_url != base_url_raw:
+        app.console.print("  [success]✓ resolved URL[/]")
+
+    if auto_key:
+        api_key = auto_key
+        suffix = api_key[-4:] if len(api_key) >= 4 else "****"
+        app.console.print(f"  [success]✓ auto-resolved key[/]  [dim]{'*' * 8}{suffix}[/]")
+    else:
+        api_key_raw = Prompt.ask("  [accent]API Key[/]", password=True)
+        if api_key_raw.strip().lower() in {"b", "q"}:
+            return "exit"
+        from core.env import resolve_env
+
+        api_key = resolve_env(api_key_raw)
+        if api_key != api_key_raw:
+            app.console.print("  [success]✓ resolved key[/]")
+
+    if not base_url or not api_key:
+        app.console.print(Panel("[error]Both Base URL and API key are required.[/]", border_style="red"))
+        _nav(app.console, "Retry")
+        choice = _ask()
+        if choice == "q":
+            return "exit"
+        return "connect"
+
+    app.console.print()
+    with app.console.status("Connecting…", spinner=SPINNER_STYLE):
+        ok = app.connect(base_url, api_key)
+
+    if ok:
+        return "main_menu"
+    return "error"
+
+
+def _error(app: ProviderInspectorApp) -> str:
+    app.console.print()
+    app.console.print(
+        Panel(
+            app.last_error_friendly,
+            title=app.last_error_title,
+            border_style="red",
+        )
+    )
+    _nav(app.console, "Retry")
+    choice = _ask()
+    if choice == "q":
+        return "exit"
+    return "connect"
+
+
+def _main_menu(app: ProviderInspectorApp) -> str | None:
+    _set_console(app.console)
+    _provider_header(app.console)
+
+    items: list[tuple[str, str]] = [
+        ("Browse Models", "browse_models"),
+        ("Full Capability Scan", "full_scan"),
+    ]
+    if app.scan_results:
+        items.append(("Browse Results", "scan_results"))
+    items.append(("Reports", "reports"))
+    items.append(("Settings", "settings"))
+
+    app.console.print()
+    for i, (label, _) in enumerate(items, 1):
+        app.console.print(f"  [bold]{i}.[/] {label}")
+
+    _nav(app.console, "Disconnect")
+    choice = _ask(set(range(1, len(items) + 1)))
+
+    if choice == "q":
+        return "exit"
+    if choice == "b":
+        return "disconnect"
+
+    if isinstance(choice, int) and 1 <= choice <= len(items):
+        return items[choice - 1][1]
+    return None
+
+
+def _browse_models(app: ProviderInspectorApp) -> str:
+    _set_console(app.console)
+    app.console.print()
+    app.console.rule("[bold]Browse Models[/bold]")
+
+    if not session.models:
+        app.console.print("\n  [warning]No models loaded.[/]")
+        _nav(app.console)
+        choice = _ask()
+        if choice == "q":
+            return "exit"
+        return "back"
+
+    tbl = Table(show_header=True, header_style="table.header", box=box.SIMPLE, expand=True)
+    tbl.add_column("#", style="dim", justify="right", width=4)
+    tbl.add_column("Model", max_width=MODEL_ID_MAX, no_wrap=True, overflow="ellipsis")
+    tbl.add_column("Owner", style="dim", max_width=18, no_wrap=True, overflow="ellipsis")
+    for i, model in enumerate(session.models, 1):
+        tbl.add_row(str(i), model.id, model.owner)
     app.console.print(tbl)
 
+    _nav(app.console)
+    choice = _ask(set(range(1, len(session.models) + 1)))
+    if choice == "q":
+        return "exit"
+    if choice == "b":
+        return "back"
 
-# ---------------------------------------------------------------------------
-# Full scan — Rich Progress with model counter + truncated IDs
-# ---------------------------------------------------------------------------
+    if isinstance(choice, int):
+        app._selected_model_idx = choice - 1
+        return "model_detail"
+    return "back"
+
+
+def _model_detail(app: ProviderInspectorApp) -> str:
+    _set_console(app.console)
+    idx = app._selected_model_idx
+    if idx < 0 or idx >= len(session.models):
+        app.console.print("\n  [warning]No model selected.[/]")
+        _nav(app.console)
+        choice = _ask()
+        if choice == "q":
+            return "exit"
+        return "back"
+
+    model = session.models[idx]
+    scan = _model_scan_for(model.id)
+
+    app.console.print()
+    app.console.rule(f"[bold]{model.id}[/bold]")
+    app.console.print()
+
+    for block in _render_model_detail(app, model, scan):
+        app.console.print(block)
+        app.console.print()
+
+    app.console.print("  [bold]1.[/] Chat")
+    app.console.print("  [bold]2.[/] Stream")
+    app.console.print("  [bold]3.[/] Tools")
+    app.console.print("  [bold]4.[/] Vision")
+    app.console.print("  [bold]5.[/] JSON Mode")
+    _nav(app.console)
+
+    choice = _ask(set(range(1, len(SINGLE_TESTS) + 1)))
+    if choice == "q":
+        return "exit"
+    if choice == "b":
+        return "back"
+
+    if not app.client or not isinstance(choice, int):
+        return "model_detail"
+
+    action = SINGLE_TESTS[choice - 1][1]
+    with app.console.status(f"Running {SINGLE_TESTS[choice - 1][0]}…", spinner=SPINNER_STYLE):
+        result = _run_single_test(app.client, model.id, action)
+
+    if not hasattr(app, "_model_results"):
+        app._model_results = {}  # type: ignore[attr-defined]
+    results_cache = app._model_results.setdefault(idx, [])
+    results_cache.append(result)
+    _display_single_result(app, *result)
+    _nav(app.console)
+    follow = _ask()
+    if follow == "q":
+        return "exit"
+    return "model_detail"
 
 
 def _full_scan(app: ProviderInspectorApp) -> str:
@@ -466,117 +688,120 @@ def _full_scan(app: ProviderInspectorApp) -> str:
     if not session.models:
         app.console.print("\n  [warning]No models loaded.[/]")
         _nav(app.console)
-        choice = _ask({NAV_BACK, NAV_EXIT})
-        if choice == NAV_EXIT:
+        choice = _ask()
+        if choice == "q":
             return "exit"
         return "back"
 
     if not app.client:
         app.console.print("\n  [error]Not connected.[/]")
         _nav(app.console)
-        choice = _ask({NAV_BACK, NAV_EXIT})
-        if choice == NAV_EXIT:
+        choice = _ask()
+        if choice == "q":
             return "exit"
         return "back"
 
-    total = len(session.models)
-    total_tasks = total * 5
+    total_models = len(session.models)
     results: list[CapabilityScan] = []
-
     app.console.print()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TaskProgressColumn(),
-        TimeElapsedColumn(),
+    with Live(
+        _render_scan_progress("Starting…", "Preparing", 0, total_models * 5, 0.0, app.console.width),
         console=app.console,
-    ) as progress:
-        task = progress.add_task("Scanning", total=total_tasks)
-
-        for i, m in enumerate(session.models, 1):
-            scan = CapabilityScan(model_id=m.id)
-            # Prioritize model name: "Model Name | Capability"
-            tag = f"[bold]{m.id}[/] [dim]({i}/{total})[/]"
-
-            progress.update(task, description=f"{tag} ❯ chat")
-            scan.chat = test_chat(app.client, m.id)
-            progress.advance(task)
-
-            progress.update(task, description=f"{tag} ❯ stream")
-            scan.streaming = test_streaming(app.client, m.id)
-            progress.advance(task)
-
-            progress.update(task, description=f"{tag} ❯ tools")
-            scan.tools = test_tool_calling(app.client, m.id)
-            progress.advance(task)
-
-            progress.update(task, description=f"{tag} ❯ vision")
-            scan.vision = test_vision(app.client, m.id)
-            progress.advance(task)
-
-            progress.update(task, description=f"{tag} ❯ json")
-            scan.json_mode = test_json_mode(app.client, m.id)
-            progress.advance(task)
-
+        refresh_per_second=12,
+        transient=True,
+    ) as live:
+        done = 0
+        start = datetime.now().timestamp() * 1000
+        for model in session.models:
+            scan = CapabilityScan(model_id=model.id)
+            for capability, action in [
+                ("Chat", "chat"),
+                ("Stream", "streaming"),
+                ("Tools", "tools"),
+                ("Vision", "vision"),
+                ("JSON", "json"),
+            ]:
+                elapsed = (datetime.now().timestamp() * 1000) - start
+                live.update(_render_scan_progress(model.id, capability, done, total_models * 5, elapsed, app.console.width))
+                if action == "chat":
+                    scan.chat = test_chat(app.client, model.id)
+                elif action == "streaming":
+                    scan.streaming = test_streaming(app.client, model.id)
+                elif action == "tools":
+                    scan.tools = test_tool_calling(app.client, model.id)
+                elif action == "vision":
+                    scan.vision = test_vision(app.client, model.id)
+                elif action == "json":
+                    scan.json_mode = test_json_mode(app.client, model.id)
+                done += 1
             results.append(scan)
+            elapsed = (datetime.now().timestamp() * 1000) - start
+            live.update(_render_scan_progress(model.id, "Done", done, total_models * 5, elapsed, app.console.width))
 
+    session.scan_results = results
     app.scan_results = results
+    return "scan_summary"
 
-    # Results + actions immediately
-    app.console.print()
-    _print_scan_table(app, results)
 
-    app.console.print()
-    app.console.print("  [bold]1.[/] Export JSON")
-    app.console.print("  [bold]2.[/] Export CSV")
-    app.console.print("  [bold]3.[/] View Results")
-    _nav(app.console)
-    choice = _ask({1, 2, 3, NAV_BACK, NAV_EXIT})
-
-    if choice == NAV_EXIT:
-        return "exit"
-    if choice == NAV_BACK:
+def _scan_summary(app: ProviderInspectorApp) -> str:
+    _set_console(app.console)
+    results = app.scan_results
+    if not results:
+        app.console.print("\n  [warning]No scan results in memory.[/]")
+        _nav(app.console)
+        choice = _ask()
+        if choice == "q":
+            return "exit"
         return "back"
+
+    total = len(results)
+    passed = sum(1 for scan in results if _scan_status(scan)[0] == "OK")
+    failed = total - passed
+
+    summary = Table.grid(padding=(0, 1))
+    summary.add_column(style="muted", no_wrap=True)
+    summary.add_column()
+    summary.add_row("Models scanned", str(total))
+    summary.add_row("Successful", f"[status.ok]{passed}[/]")
+    summary.add_row("Failed", f"[status.fail]{failed}[/]")
+
+    app.console.print()
+    app.console.print(Panel(summary, title="Scan Complete", border_style="panel.border"))
+
+    failed_rows = [scan for scan in results if _scan_status(scan)[0] != "OK"]
+    if failed_rows:
+        tbl = Table(show_header=True, header_style="table.header", box=box.SIMPLE, expand=True)
+        tbl.add_column("Model", max_width=MODEL_ID_MAX, no_wrap=True, overflow="ellipsis")
+        tbl.add_column("Reason", overflow="ellipsis")
+        for scan in failed_rows:
+            reason = _failure_reason(scan)
+            tbl.add_row(scan.model_id, reason)
+        app.console.print(tbl)
+
+    app.console.print()
+    app.console.print("  [bold]1.[/] Browse Results")
+    app.console.print("  [bold]2.[/] Export JSON")
+    app.console.print("  [bold]3.[/] Export CSV")
+    _nav(app.console, "Back to Menu")
+
+    choice = _ask({1, 2, 3})
+    if choice == "q":
+        return "exit"
+    if choice == "b":
+        return "back"
+
     if choice == 1:
-        fname = _save_report([asdict(s) for s in results], "json")
-        app.console.print(f"\n  [success]Saved[/] reports/{fname}")
         return "scan_results"
     if choice == 2:
+        fname = _save_report([asdict(s) for s in results], "json")
+        app.console.print(f"\n  [success]Saved[/] reports/{fname}")
+        return "scan_summary"
+    if choice == 3:
         fname = _save_report(results, "csv")
         app.console.print(f"\n  [success]Saved[/] reports/{fname}")
-        return "scan_results"
-    if choice == 3:
-        return "scan_results"
-    return "scan_results"
-
-
-def _print_scan_table(app: ProviderInspectorApp, results: list[CapabilityScan], title: str = "Results") -> None:
-    tbl = Table(show_header=True, header_style="table.header", title=title)
-    tbl.add_column("Model", style="bold magenta", max_width=MODEL_ID_MAX, no_wrap=True, overflow="ellipsis")
-    tbl.add_column("Chat", justify="center")
-    tbl.add_column("Stream", justify="center")
-    tbl.add_column("Tools", justify="center")
-    tbl.add_column("Vision", justify="center")
-    tbl.add_column("JSON Mode", justify="center")
-    tbl.add_column("Latency", justify="right", style="dim white")
-
-    for s in results:
-        chat_ok = "[success]Y[/]" if s.chat.latency.ok and s.chat.content else "[error]N[/]"
-        stream_ok = "[success]Y[/]" if s.streaming.first_token_ms is not None and not s.streaming.error else "[error]N[/]"
-        tools_ok = "[success]Y[/]" if s.tools.supported else "[error]N[/]"
-        vision_ok = "[success]Y[/]" if s.vision.supported else "[error]N[/]"
-        json_ok = "[success]Y[/]" if s.json_mode.supported else "[error]N[/]"
-        lat = f"{s.chat.latency.total_ms:.0f}ms" if s.chat.latency.ok else "—"
-        tbl.add_row(s.model_id, chat_ok, stream_ok, tools_ok, vision_ok, json_ok, lat)
-
-    app.console.print(tbl)
-
-
-# ---------------------------------------------------------------------------
-# Scan Results (in-memory)
-# ---------------------------------------------------------------------------
+        return "scan_summary"
+    return "scan_summary"
 
 
 def _scan_results(app: ProviderInspectorApp) -> str:
@@ -585,107 +810,31 @@ def _scan_results(app: ProviderInspectorApp) -> str:
 
     if not results:
         app.console.print("\n  [warning]No scan results in memory.[/]")
-        app.console.print("  [dim]Run a Full Capability Scan first.[/]")
+        app.console.print("  [dim]Run a full scan first.[/]")
         _nav(app.console)
-        choice = _ask({NAV_BACK, NAV_EXIT})
-        if choice == NAV_EXIT:
+        choice = _ask()
+        if choice == "q":
             return "exit"
         return "back"
 
     app.console.print()
-    app.console.rule("[bold]Scan Results[/bold]")
+    app.console.rule("[bold]Browse Results[/bold]")
     app.console.print()
-    app.console.print("  [bold]1.[/] Browse")
-    app.console.print("  [bold]2.[/] Sort by Latency")
-    app.console.print("  [bold]3.[/] Sort by Capabilities")
-    app.console.print("  [bold]4.[/] Export JSON")
-    app.console.print("  [bold]5.[/] Export CSV")
+    app.console.print(_render_scan_table(results, "Model Summary"))
+    app.console.print()
+    app.console.print("  [dim]Select a model for details.[/]")
     _nav(app.console)
-    choice = _ask({1, 2, 3, 4, 5, NAV_BACK, NAV_EXIT})
 
-    if choice == NAV_EXIT:
+    choice = _ask(set(range(1, len(results) + 1)))
+    if choice == "q":
         return "exit"
-    if choice == NAV_BACK:
+    if choice == "b":
         return "back"
 
-    if choice == 1:
-        _browse_scan_results(app, results)
-        return "scan_results"
-    if choice == 2:
-        sorted_r = sorted(results, key=lambda s: s.chat.latency.total_ms if s.chat.latency.ok else 99999)
-        _print_scan_table(app, sorted_r, "Sorted by Latency")
-        _nav(app.console)
-        nav = _ask({NAV_BACK, NAV_EXIT})
-        return "exit" if nav == NAV_EXIT else "scan_results"
-    if choice == 3:
-        sorted_r = sorted(results, key=lambda s: sum([
-            s.chat.latency.ok and bool(s.chat.content),
-            s.streaming.first_token_ms is not None and not s.streaming.error,
-            s.tools.supported,
-            s.vision.supported,
-            s.json_mode.supported,
-        ]), reverse=True)
-        _print_scan_table(app, sorted_r, "Sorted by Capabilities")
-        _nav(app.console)
-        nav = _ask({NAV_BACK, NAV_EXIT})
-        return "exit" if nav == NAV_EXIT else "scan_results"
-    if choice == 4:
-        fname = _save_report([asdict(s) for s in results], "json")
-        app.console.print(f"\n  [success]Saved[/] reports/{fname}")
-        return "scan_results"
-    if choice == 5:
-        fname = _save_report(results, "csv")
-        app.console.print(f"\n  [success]Saved[/] reports/{fname}")
-        return "scan_results"
-
-    return "scan_results"
-
-
-def _browse_scan_results(app: ProviderInspectorApp, results: list[CapabilityScan]) -> None:
-    tbl = Table(show_header=True, header_style="table.header")
-    tbl.add_column("#", style="dim white", justify="right", width=4)
-    tbl.add_column("Model ID", max_width=MODEL_ID_MAX, no_wrap=True, overflow="ellipsis")
-    tbl.add_column("Chat", justify="center")
-    tbl.add_column("Latency", justify="right", style="dim white")
-    for i, s in enumerate(results, 1):
-        chat_ok = "[success]Y[/]" if s.chat.latency.ok and s.chat.content else "[error]N[/]"
-        lat = f"{s.chat.latency.total_ms:.0f}ms" if s.chat.latency.ok else "—"
-        tbl.add_row(str(i), s.model_id, chat_ok, lat)
-    app.console.print(tbl)
-
-    _nav(app.console)
-    model_range = set(range(1, len(results) + 1))
-    choice = _ask(model_range | {NAV_BACK, NAV_EXIT})
-    if choice in {NAV_BACK, NAV_EXIT}:
-        return
-
-    s = results[choice - 1]
-    app.console.print()
-    app.console.rule(f"[bold]{s.model_id}[/bold]")
-
-    dtbl = Table(show_header=False, box=None, padding=(0, 2))
-    dtbl.add_column("Cap", style="dim")
-    dtbl.add_column("Status")
-    dtbl.add_column("Detail", style="dim")
-
-    dtbl.add_row("Chat", "[success]Y[/]" if s.chat.latency.ok and s.chat.content else "[error]N[/]",
-                 f"{s.chat.latency.total_ms:.0f}ms" if s.chat.latency.ok else "failed")
-    dtbl.add_row("Streaming", "[success]Y[/]" if s.streaming.first_token_ms is not None and not s.streaming.error else "[error]N[/]",
-                 f"ttft={s.streaming.first_token_ms:.0f}ms" if s.streaming.first_token_ms else "n/a")
-    dtbl.add_row("Tools", "[success]Y[/]" if s.tools.supported else "[error]N[/]",
-                 f"{len(s.tools.tool_calls)} calls" if s.tools.tool_calls else "")
-    dtbl.add_row("Vision", "[success]Y[/]" if s.vision.supported else "[error]N[/]", "")
-    dtbl.add_row("JSON Mode", "[success]Y[/]" if s.json_mode.supported else "[error]N[/]",
-                 "parsed" if getattr(s.json_mode, "parsed_json", False) else "unparsed")
-    app.console.print(dtbl)
-
-    _nav(app.console)
-    _ask({NAV_BACK, NAV_EXIT})
-
-
-# ---------------------------------------------------------------------------
-# Reports
-# ---------------------------------------------------------------------------
+    if isinstance(choice, int):
+        app._selected_model_idx = choice - 1
+        return "model_detail"
+    return "back"
 
 
 def _reports(app: ProviderInspectorApp) -> str:
@@ -719,38 +868,41 @@ def _reports(app: ProviderInspectorApp) -> str:
         app.console.print("  [warning]No reports found.[/]")
         app.console.print("  [dim]Run a scan first, then export.[/]")
         _nav(app.console)
-        choice = _ask({NAV_BACK, NAV_EXIT})
-        if choice == NAV_EXIT:
+        choice = _ask()
+        if choice == "q":
             return "exit"
         return "back"
 
     _nav(app.console)
-    valid = set(range(1, item_num)) | {NAV_BACK, NAV_EXIT}
+    valid = set(range(1, item_num))
     choice = _ask(valid)
 
-    if choice == NAV_EXIT:
+    if choice == "q":
         return "exit"
-    if choice == NAV_BACK:
+    if choice == "b":
         return "back"
 
-    action = items[choice - 1]
+    if not isinstance(choice, int):
+        return "reports"
 
+    action = items[choice - 1]
     if action == "view_existing":
         _view_existing_reports(app)
         return "reports"
-
     if action == "export_current":
         app.console.print("\n  [bold]1.[/] JSON    [bold]2.[/] CSV")
         fmt_choice = _ask({1, 2})
+        if fmt_choice == "q":
+            return "exit"
+        if fmt_choice == "b":
+            return "reports"
         fmt = "json" if fmt_choice == 1 else "csv"
         fname = _save_report([asdict(s) for s in app.scan_results] if fmt == "json" else app.scan_results, fmt)
         app.console.print(f"\n  [success]Saved[/] reports/{fname}")
         return "reports"
-
     if action == "delete_report":
         _delete_report(app)
         return "reports"
-
     return "reports"
 
 
@@ -761,10 +913,10 @@ def _view_existing_reports(app: ProviderInspectorApp) -> None:
         return
 
     app.console.print()
-    tbl = Table(show_header=True, header_style="table.header")
-    tbl.add_column("#", style="dim white", justify="right", width=4)
-    tbl.add_column("Filename")
-    tbl.add_column("Size", justify="right", style="dim white")
+    tbl = Table(show_header=True, header_style="table.header", box=box.SIMPLE, expand=True)
+    tbl.add_column("#", style="dim", justify="right", width=4)
+    tbl.add_column("Filename", overflow="ellipsis")
+    tbl.add_column("Size", justify="right", width=10)
     for i, p in enumerate(existing, 1):
         size = p.stat().st_size
         size_str = f"{size / 1024:.1f}KB" if size > 1024 else f"{size}B"
@@ -772,9 +924,10 @@ def _view_existing_reports(app: ProviderInspectorApp) -> None:
     app.console.print(tbl)
 
     _nav(app.console)
-    report_range = set(range(1, len(existing) + 1))
-    choice = _ask(report_range | {NAV_BACK, NAV_EXIT})
-    if choice in {NAV_BACK, NAV_EXIT}:
+    choice = _ask(set(range(1, len(existing) + 1)))
+    if choice in {"q", "b"}:
+        return
+    if not isinstance(choice, int):
         return
 
     chosen = existing[choice - 1]
@@ -792,7 +945,7 @@ def _view_existing_reports(app: ProviderInspectorApp) -> None:
         app.console.print(f"\n  [error]Cannot read: {exc}[/]")
 
     _nav(app.console)
-    _ask({NAV_BACK, NAV_EXIT})
+    _ask()
 
 
 def _delete_report(app: ProviderInspectorApp) -> None:
@@ -806,17 +959,17 @@ def _delete_report(app: ProviderInspectorApp) -> None:
         app.console.print(f"  [bold]{i}.[/] {p.name}")
 
     _nav(app.console)
-    report_range = set(range(1, len(existing) + 1))
-    choice = _ask(report_range | {NAV_BACK, NAV_EXIT})
-    if choice in {NAV_BACK, NAV_EXIT}:
+    choice = _ask(set(range(1, len(existing) + 1)))
+    if choice in {"q", "b"}:
+        return
+    if not isinstance(choice, int):
         return
 
     chosen = existing[choice - 1]
-    # Confirmation
     app.console.print(f"\n  [warning]Delete {chosen.name}?[/]")
     app.console.print("  [bold]1.[/] Yes    [bold]2.[/] No")
     confirm = _ask({1, 2})
-    if confirm == 2:
+    if confirm in {"q", "b"} or confirm == 2:
         app.console.print("  [dim]Cancelled.[/]")
         return
 
@@ -825,11 +978,6 @@ def _delete_report(app: ProviderInspectorApp) -> None:
         app.console.print(f"\n  [success]Deleted[/] {chosen.name}")
     except OSError as exc:
         app.console.print(f"\n  [error]Failed: {exc}[/]")
-
-
-# ---------------------------------------------------------------------------
-# Settings — no About (credits on splash)
-# ---------------------------------------------------------------------------
 
 
 def _settings(app: ProviderInspectorApp) -> str:
@@ -841,29 +989,23 @@ def _settings(app: ProviderInspectorApp) -> str:
     app.console.print("  [bold]2.[/] Disconnect")
     _nav(app.console)
 
-    choice = _ask({1, 2, NAV_BACK, NAV_EXIT})
-
-    if choice == NAV_EXIT:
+    choice = _ask({1, 2})
+    if choice == "q":
         return "exit"
-    if choice == NAV_BACK:
+    if choice == "b":
         return "back"
     if choice == 1:
         if app.scan_results:
             app.console.print("\n  [warning]Reconnecting will discard scan results.[/]")
             app.console.print("  [bold]1.[/] Continue    [bold]2.[/] Cancel")
-            c = _ask({1, 2})
-            if c == 2:
+            confirm = _ask({1, 2})
+            if confirm == 2:
                 return "settings"
         return "connect"
     if choice == 2:
         return "disconnect"
-
     return "back"
 
-
-# ---------------------------------------------------------------------------
-# Dispatcher
-# ---------------------------------------------------------------------------
 
 _SCREEN_MAP: dict[Screen, Callable] = {
     Screen.SPLASH: _splash,
@@ -873,6 +1015,7 @@ _SCREEN_MAP: dict[Screen, Callable] = {
     Screen.BROWSE_MODELS: _browse_models,
     Screen.MODEL_DETAIL: _model_detail,
     Screen.FULL_SCAN: _full_scan,
+    Screen.SCAN_SUMMARY: _scan_summary,
     Screen.SCAN_RESULTS: _scan_results,
     Screen.REPORTS: _reports,
     Screen.SETTINGS: _settings,
@@ -885,6 +1028,7 @@ _ACTION_TO_SCREEN: dict[str, Screen] = {
     "browse_models": Screen.BROWSE_MODELS,
     "model_detail": Screen.MODEL_DETAIL,
     "full_scan": Screen.FULL_SCAN,
+    "scan_summary": Screen.SCAN_SUMMARY,
     "scan_results": Screen.SCAN_RESULTS,
     "reports": Screen.REPORTS,
     "settings": Screen.SETTINGS,
@@ -893,23 +1037,24 @@ _ACTION_TO_SCREEN: dict[str, Screen] = {
 
 
 def render(app: ProviderInspectorApp) -> str | None:
-    """Render current screen, return action string or None to quit."""
-    # Clear screen between renders for clean UX
     app.console.clear()
 
     handler = _SCREEN_MAP.get(app.screen)
     if handler is None:
-        return "exit"
+        return None
 
     action = handler(app)
     if action is None or action == "exit":
         return None
     if action == "disconnect":
         app.disconnect()
-        app.go(Screen.CONNECTION)
+        app.screen = Screen.CONNECTION
         return action
     if action == "back":
         app.back()
+        return action
+    if action == "scan_summary":
+        app.screen = Screen.SCAN_SUMMARY
         return action
 
     target = _ACTION_TO_SCREEN.get(action)
