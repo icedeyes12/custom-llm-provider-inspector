@@ -324,14 +324,32 @@ def _capability_summary(scan: CapabilityScan) -> str:
     return " ".join(enabled)
 
 
-def _failure_reason(scan: CapabilityScan) -> str:
+def _finding_summary(scan: CapabilityScan) -> list[tuple[str, bool]]:
+    return [
+        ("Chat", scan.chat.observed),
+        ("Stream", scan.streaming.observed),
+        ("Tools", scan.tools.observed),
+        ("Vision", scan.vision.observed),
+        ("JSON", scan.json_mode.observed),
+    ]
+
+
+def _finding_reason(scan: CapabilityScan) -> list[tuple[str, str]]:
+    reasons: list[tuple[str, str]] = []
     for label, capability_key in CAPABILITY_LABELS:
         result = getattr(scan, capability_key)
-        if not _capability_ok(result):
+        if not result.observed:
             reason = _result_reason(result)
             if reason:
-                return f"{label}: {_truncate(reason, 64)}"
-            return label
+                reasons.append((label, reason))
+    return reasons
+
+
+def _failure_reason(scan: CapabilityScan) -> str:
+    reasons = _finding_reason(scan)
+    if reasons:
+        label, reason = reasons[0]
+        return f"{label}: {_truncate(reason, 64)}"
     return ""
 
 
@@ -696,21 +714,16 @@ def _render_scan_table(results: list[CapabilityScan], title: str = "Results") ->
     tbl = Table(show_header=True, header_style="table.header", title=title, box=box.SIMPLE, expand=True)
     tbl.add_column("#", style="dim", justify="right", width=4)
     tbl.add_column("Model", style="bold magenta", max_width=MODEL_ID_MAX, no_wrap=True, overflow="ellipsis")
-    tbl.add_column("Status", justify="center", width=10)
+    tbl.add_column("Observed", justify="center", width=16)
     tbl.add_column("Latency", justify="right", width=10)
-    tbl.add_column("Capabilities", max_width=24, overflow="ellipsis")
+    tbl.add_column("Findings", max_width=24, overflow="ellipsis")
 
     for idx, scan in enumerate(results, 1):
-        status, status_style = _scan_status(scan)
+        findings = _finding_summary(scan)
+        observed = len([item for item in findings if item[1]])
         latency = _format_ms(_primary_latency(scan))
-        caps = _capability_summary(scan)
-        tbl.add_row(
-            str(idx),
-            scan.model_id,
-            f"[{status_style}]{status}[/{status_style}]",
-            latency,
-            caps,
-        )
+        finding_text = " ".join([f"✓ {name}" if ok else f"✗ {name}" for name, ok in findings])
+        tbl.add_row(str(idx), scan.model_id, f"{observed} / {len(findings)}", latency, finding_text)
     return tbl
 
 
@@ -722,8 +735,6 @@ def _render_model_detail(app: ProviderInspectorApp, model: ModelInfo, scan: Capa
     overview.add_column()
     overview.add_row("Model", f"[bold]{model.id}[/]")
     if scan is not None:
-        status, status_style = _scan_status(scan)
-        overview.add_row("Status", f"[{status_style}]{status}[/{status_style}]")
         latency = _format_ms(_primary_latency(scan))
         if latency:
             overview.add_row("Latency", latency)
@@ -734,26 +745,25 @@ def _render_model_detail(app: ProviderInspectorApp, model: ModelInfo, scan: Capa
     blocks.append(Panel(overview, title="Model", border_style="panel.border"))
 
     if scan is not None:
-        cap_tbl = Table(show_header=True, header_style="table.header", box=box.SIMPLE, expand=True)
-        cap_tbl.add_column("Capability", style="bold", max_width=12, no_wrap=True)
-        cap_tbl.add_column("Result", justify="center", width=10)
-        cap_tbl.add_column("Reason", overflow="ellipsis")
+        findings = Table(show_header=False, box=box.SIMPLE, expand=True, pad_edge=False)
+        findings.add_column("Mark", width=3)
+        findings.add_column("Capability", style="bold", width=12)
+        findings.add_column("Status", width=12)
+        findings.add_column("Detail", overflow="ellipsis")
 
-        capability_rows = [
-            ("Chat", scan.chat),
-            ("Stream", scan.streaming),
-            ("Tools", scan.tools),
-            ("Vision", scan.vision),
-            ("JSON", scan.json_mode),
+        rows = [
+            ("Chat", scan.chat, "content" if scan.chat.observed else _result_reason(scan.chat)),
+            ("Stream", scan.streaming, "first token" if scan.streaming.observed else _result_reason(scan.streaming)),
+            ("Tools", scan.tools, "tool calls" if scan.tools.observed else _result_reason(scan.tools)),
+            ("Vision", scan.vision, "image input" if scan.vision.observed else _result_reason(scan.vision)),
+            ("JSON", scan.json_mode, "json output" if scan.json_mode.observed else _result_reason(scan.json_mode)),
         ]
-        for label, result in capability_rows:
-            ok = _capability_ok(result)
-            style = "status.ok" if ok else "status.fail"
-            reason = _result_reason(result)
-            cap_tbl.add_row(label, f"[{style}]{'PASS' if ok else 'FAIL'}[/{style}]", reason)
-        blocks.append(cap_tbl)
+        for label, result, detail in rows:
+            ok = result.observed
+            findings.add_row("✓" if ok else "✗", label, "observed" if ok else "unsupported", detail)
+        blocks.append(Panel(findings, title="Inspection Findings", border_style="panel.border"))
     else:
-        blocks.append(Panel("Run a full scan to see capability results.", border_style="panel.border"))
+        blocks.append(Panel("Run a full scan to inspect this model.", border_style="panel.border"))
 
     meta = Table.grid(padding=(0, 1))
     meta.add_column(style="muted", no_wrap=True)
@@ -1112,27 +1122,31 @@ def _scan_summary(app: ProviderInspectorApp) -> str:
         return "back"
 
     total = len(results)
-    passed = sum(1 for scan in results if _scan_status(scan)[0] == "OK")
-    failed = total - passed
+    discovered = sum(len(_finding_summary(scan)) for scan in results)
+    observed = sum(1 for scan in results for _, ok in _finding_summary(scan) if ok)
 
     summary = Table.grid(padding=(0, 1))
     summary.add_column(style="muted", no_wrap=True)
     summary.add_column()
     summary.add_row("Models scanned", str(total))
-    summary.add_row("Successful", f"[status.ok]{passed}[/]")
-    summary.add_row("Failed", f"[status.fail]{failed}[/]")
+    summary.add_row("Findings observed", str(observed))
+    summary.add_row("Findings available", str(discovered))
 
     app.console.print()
-    app.console.print(Panel(summary, title="Scan Complete", border_style="panel.border"))
+    app.console.print(Panel(summary, title="Inspection Complete", border_style="panel.border"))
 
-    failed_rows = [scan for scan in results if _scan_status(scan)[0] != "OK"]
-    if failed_rows:
+    issues = []
+    for scan in results:
+        for label, reason in _finding_reason(scan):
+            issues.append((scan.model_id, label, reason))
+
+    if issues:
         tbl = Table(show_header=True, header_style="table.header", box=box.SIMPLE, expand=True)
         tbl.add_column("Model", max_width=MODEL_ID_MAX, no_wrap=True, overflow="ellipsis")
-        tbl.add_column("Reason", overflow="ellipsis")
-        for scan in failed_rows:
-            reason = _failure_reason(scan)
-            tbl.add_row(scan.model_id, reason)
+        tbl.add_column("Capability", width=12)
+        tbl.add_column("Note", overflow="ellipsis")
+        for model_id, label, reason in issues:
+            tbl.add_row(model_id, label, reason)
         app.console.print(tbl)
 
     app.console.print()

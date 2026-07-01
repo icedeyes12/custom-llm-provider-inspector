@@ -45,6 +45,10 @@ class ChatResult:
     latency: LatencyResult = field(default_factory=lambda: LatencyResult())
     raw: dict[str, Any] = field(default_factory=dict)
 
+    @property
+    def observed(self) -> bool:
+        return self.latency.ok and bool(self.content)
+
 
 @dataclass
 class StreamResult:
@@ -57,6 +61,10 @@ class StreamResult:
     status_code: int = 0
     error: str | None = None
 
+    @property
+    def observed(self) -> bool:
+        return self.first_token_ms is not None and not self.error
+
 
 @dataclass
 class ToolCallResult:
@@ -68,6 +76,10 @@ class ToolCallResult:
     latency: LatencyResult = field(default_factory=lambda: LatencyResult())
     error: str | None = None
 
+    @property
+    def observed(self) -> bool:
+        return self.supported
+
 
 @dataclass
 class VisionResult:
@@ -77,6 +89,10 @@ class VisionResult:
     response_text: str = ""
     latency: LatencyResult = field(default_factory=lambda: LatencyResult())
     error: str | None = None
+
+    @property
+    def observed(self) -> bool:
+        return self.supported
 
 
 @dataclass
@@ -89,10 +105,52 @@ class JsonModeResult:
     latency: LatencyResult = field(default_factory=lambda: LatencyResult())
     error: str | None = None
 
+    @property
+    def observed(self) -> bool:
+        return self.supported
+
+
+@dataclass
+class CapabilityFinding:
+    """One discovered capability entry inside an inspection report."""
+
+    name: str
+    observed: bool
+    note: str = ""
+    sample: str = ""
+    latency_ms: float | None = None
+    first_token_ms: float | None = None
+    chunks: int = 0
+
+
+@dataclass
+class InspectionReport:
+    """Presentation-oriented inspection report for one model."""
+
+    model_id: str
+    owner: str = "unknown"
+    provider: str = ""
+    base_url: str = ""
+    latency_ms: float | None = None
+    findings: list[CapabilityFinding] = field(default_factory=list)
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def observed_count(self) -> int:
+        return sum(1 for finding in self.findings if finding.observed)
+
+    @property
+    def discovered_summary(self) -> str:
+        parts: list[str] = []
+        for finding in self.findings:
+            icon = "✓" if finding.observed else "✗"
+            parts.append(f"{icon} {finding.name}")
+        return "  ".join(parts)
+
 
 @dataclass
 class CapabilityScan:
-    """Full capability scan result for a single model."""
+    """Compatibility container kept for scan logic and exports."""
 
     model_id: str
     chat: ChatResult = field(default_factory=ChatResult)
@@ -100,6 +158,49 @@ class CapabilityScan:
     tools: ToolCallResult = field(default_factory=ToolCallResult)
     vision: VisionResult = field(default_factory=VisionResult)
     json_mode: JsonModeResult = field(default_factory=JsonModeResult)
+
+    @property
+    def report(self) -> InspectionReport:
+        findings = [
+            CapabilityFinding(
+                name="Chat",
+                observed=self.chat.observed,
+                note="chat completion observed" if self.chat.observed else self.chat.latency.error or "no chat response",
+                sample=self.chat.content,
+                latency_ms=self.chat.latency.total_ms,
+            ),
+            CapabilityFinding(
+                name="Stream",
+                observed=self.streaming.observed,
+                note="streaming observed" if self.streaming.observed else self.streaming.error or "no stream output",
+                sample=self.streaming.content,
+                latency_ms=self.streaming.total_ms,
+                first_token_ms=self.streaming.first_token_ms,
+                chunks=self.streaming.chunks,
+            ),
+            CapabilityFinding(
+                name="Tools",
+                observed=self.tools.observed,
+                note="tool calls observed" if self.tools.observed else self.tools.error or "tool calls unsupported",
+                sample=self.tools.response_text,
+                latency_ms=self.tools.latency.total_ms,
+            ),
+            CapabilityFinding(
+                name="Vision",
+                observed=self.vision.observed,
+                note="vision observed" if self.vision.observed else self.vision.error or "vision unsupported",
+                sample=self.vision.response_text,
+                latency_ms=self.vision.latency.total_ms,
+            ),
+            CapabilityFinding(
+                name="JSON",
+                observed=self.json_mode.observed,
+                note="json mode observed" if self.json_mode.observed else self.json_mode.error or "json mode unsupported",
+                sample=self.json_mode.response_text,
+                latency_ms=self.json_mode.latency.total_ms,
+            ),
+        ]
+        return InspectionReport(model_id=self.model_id, findings=findings)
 
 
 @dataclass
