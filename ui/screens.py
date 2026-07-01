@@ -8,15 +8,20 @@ Navigation:
 from __future__ import annotations
 
 import json
-from dataclasses import asdict
+import threading
+import time
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable
 
 from rich import box
 from rich.align import Align
+from rich.console import Group
 from rich.live import Live
+from rich.layout import Layout
 from rich.panel import Panel
+from rich.progress import BarColumn, Progress, TextColumn
 from rich.prompt import Prompt
 from rich.table import Table
 from rich.text import Text
@@ -40,7 +45,14 @@ if TYPE_CHECKING:
 
 REPORTS_DIR = Path("reports")
 MODEL_ID_MAX = 24
-
+RECENT_ACTIVITY_LIMIT = 8
+CAPABILITY_SEQUENCE = [
+    ("Chat", "chat"),
+    ("Stream", "streaming"),
+    ("Tools", "tools"),
+    ("Vision", "vision"),
+    ("JSON", "json_mode"),
+]
 SINGLE_TESTS = [
     ("Chat", "test_chat"),
     ("Stream", "test_streaming"),
@@ -56,6 +68,32 @@ CAPABILITY_LABELS = [
     ("Vision", "vision"),
     ("JSON", "json_mode"),
 ]
+
+
+@dataclass
+class _RecentModelResult:
+    model_id: str
+    success: bool
+    reason: str = ""
+
+
+@dataclass
+class _ScanDashboardState:
+    total_models: int
+    current_model_index: int = 0
+    current_model_id: str = ""
+    current_model_owner: str = ""
+    current_capability_index: int = 0
+    current_capability_name: str = ""
+    completed_models: int = 0
+    completed_capabilities: int = 0
+    current_scan: CapabilityScan | None = None
+    recent: list[_RecentModelResult] = field(default_factory=list)
+    results: list[CapabilityScan] = field(default_factory=list)
+    running: bool = True
+    started_at: float = field(default_factory=time.monotonic)
+    error: str = ""
+    lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
 
 def _truncate(text: str, max_len: int) -> str:
@@ -80,6 +118,17 @@ def _format_ms(ms: float | None) -> str:
     if ms is None:
         return ""
     return f"{ms:.0f}ms"
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    minutes, secs = divmod(total, 60)
+    return f"{minutes:02d}:{secs:02d}" if minutes else f"{secs:02d}"
+
+
+def _spinner_frame() -> str:
+    frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    return frames[int(time.monotonic() * 6) % len(frames)]
 
 
 def _set_console(console) -> None:
@@ -276,8 +325,8 @@ def _capability_summary(scan: CapabilityScan) -> str:
 
 
 def _failure_reason(scan: CapabilityScan) -> str:
-    for label, field in CAPABILITY_LABELS:
-        result = getattr(scan, field)
+    for label, capability_key in CAPABILITY_LABELS:
+        result = getattr(scan, capability_key)
         if not _capability_ok(result):
             reason = _result_reason(result)
             if reason:
@@ -292,6 +341,330 @@ def _status_style(status: str) -> str:
     if status == "FAILED":
         return "status.fail"
     return "status.partial"
+
+
+def _scan_progress_layout(state: _ScanDashboardState, width: int) -> Layout:
+    with state.lock:
+        total_models = state.total_models
+        current_model_index = state.current_model_index
+        current_model_id = state.current_model_id
+        current_model_owner = state.current_model_owner
+        current_capability_index = state.current_capability_index
+        current_capability_name = state.current_capability_name
+        completed_models = state.completed_models
+        completed_capabilities = state.completed_capabilities
+        recent = list(state.recent)
+        current_scan = state.current_scan
+        started_at = state.started_at
+        running = state.running
+        error = state.error
+
+    elapsed = _format_elapsed(time.monotonic() - started_at)
+    provider = detect_provider(session.base_url) or "Custom"
+    host = session.base_url.replace("https://", "").replace("http://", "").split("/")[0]
+    spinner = _spinner_frame() if running else "✓"
+
+    layout = Layout(name="root")
+    layout.split_column(
+        Layout(_scan_title_panel(provider, host, total_models, completed_models, elapsed, spinner), size=5),
+        Layout(
+            _scan_current_model_panel(
+                current_model_id,
+                current_model_owner,
+                current_model_index,
+                total_models,
+                current_capability_name,
+                running,
+                error,
+            ),
+            size=9,
+        ),
+        Layout(
+            _scan_current_capability_panel(
+                current_scan,
+                current_capability_name,
+                current_capability_index,
+                running,
+            ),
+            size=10,
+        ),
+        Layout(
+            _scan_progress_panel(
+                completed_models,
+                total_models,
+                completed_capabilities,
+                current_capability_index,
+                elapsed,
+            ),
+            size=8,
+        ),
+        Layout(_scan_recent_panel(recent), ratio=1),
+    )
+    return layout
+
+
+def _scan_title_panel(provider: str, host: str, total_models: int, completed_models: int, elapsed: str, spinner: str) -> Panel:
+    lines = Table.grid(expand=True)
+    lines.add_column()
+    lines.add_row(Text("Full Capability Scan", style="bold bright_white"))
+    summary = Text()
+    summary.append(f"{spinner} ", style="status.active")
+    summary.append(f"{provider}", style="bold")
+    if host:
+        summary.append(f" · {host}", style="muted")
+    summary.append(f" · {completed_models} / {total_models} models", style="muted")
+    summary.append(f" · {elapsed} elapsed", style="muted")
+    lines.add_row(summary)
+    return Panel(lines, border_style="panel.border")
+
+
+def _scan_current_model_panel(
+    model_id: str,
+    owner: str,
+    index: int,
+    total: int,
+    capability: str,
+    running: bool,
+    error: str,
+) -> Panel:
+    body = Table.grid(expand=True)
+    body.add_column(ratio=1)
+    if model_id:
+        body.add_row(Text(model_id, style="bold bright_white", overflow="fold"))
+        context = Text()
+        if owner:
+            context.append(f"Owner      : {owner}", style="muted")
+            if capability:
+                context.append("\n")
+        if capability:
+            context.append(f"Capability : {capability}", style="muted")
+        if index and total:
+            context.append("\n")
+            context.append(f"Model      : {index} / {total}", style="muted")
+        if running:
+            context.append("\n")
+            context.append("Status     : Testing...", style="status.active")
+        body.add_row(context)
+    else:
+        body.add_row(Text("Waiting for the first model…", style="muted"))
+    if error:
+        body.add_row(Text(_truncate(error, 120), style="status.fail"))
+    return Panel(body, title="Current Model", border_style="panel.border")
+
+
+def _capability_marker(active: bool, result: CapabilityScan | None, label: str, field: str) -> tuple[str, str]:
+    if active:
+        return ("⟳", "status.active")
+    if result is None:
+        return ("•", "status.pending")
+    scan_result = getattr(result, field)
+    if _capability_ok(scan_result):
+        return ("✓", "status.ok")
+    return ("✗", "status.fail")
+
+
+def _scan_current_capability_panel(
+    scan: CapabilityScan | None,
+    capability: str,
+    capability_index: int,
+    running: bool,
+) -> Panel:
+    rows = Table.grid(expand=True)
+    rows.add_column(ratio=1)
+    rows.add_column(width=4, justify="right")
+
+    current_label = capability or "Waiting"
+    if running and current_label:
+        header = Text()
+        header.append("Status     : ", style="muted")
+        header.append(f"Testing {current_label}...", style="status.active")
+    else:
+        header = Text("Status     : Idle", style="muted")
+    rows.add_row(header, Text(_spinner_frame() if running else "", style="status.active"))
+
+    for label, capability_key in CAPABILITY_SEQUENCE:
+        active = running and label == capability
+        marker, marker_style = _capability_marker(active, scan, label, capability_key)
+        label_text = Text(label, style="status.active" if active else "muted")
+        rows.add_row(label_text, Text(marker, style=marker_style))
+
+    return Panel(rows, title="Current Capability", border_style="panel.border")
+
+
+def _progress_bar(label: str, completed: int, total: int, suffix: str, style: str) -> Progress:
+    progress = Progress(
+        TextColumn(f"[muted]{label}[/]"),
+        BarColumn(bar_width=None, complete_style=style, finished_style=style),
+        TextColumn(f"[bold]{completed} / {total} {suffix}[/]"),
+        expand=True,
+    )
+    task_id = progress.add_task(label, total=max(total, 1))
+    progress.update(task_id, completed=min(completed, total))
+    return progress
+
+
+def _scan_progress_panel(
+    completed_models: int,
+    total_models: int,
+    completed_capabilities: int,
+    capability_index: int,
+    elapsed: str,
+) -> Panel:
+    capability_total = len(CAPABILITY_SEQUENCE)
+    current_capability = CAPABILITY_SEQUENCE[max(0, min(capability_index - 1, capability_total - 1))][0] if capability_index else "Starting"
+    body = Group(
+        _progress_bar("Model", completed_models, total_models, "models", "status.ok"),
+        _progress_bar("Capability", max(0, capability_index), capability_total, current_capability, "status.active"),
+        Text(f"Elapsed     : {elapsed}", style="muted"),
+    )
+    return Panel(body, title="Progress", border_style="panel.border")
+
+
+def _scan_recent_panel(recent: list[_RecentModelResult]) -> Panel:
+    if not recent:
+        return Panel(Text("Waiting for completed models…", style="muted"), title="Recent Activity", border_style="panel.border")
+
+    table = Table(show_header=False, box=box.SIMPLE, expand=True, pad_edge=False)
+    table.add_column("Mark", width=3)
+    table.add_column("Model", overflow="fold")
+    table.add_column("Reason", overflow="fold")
+
+    for item in recent[-RECENT_ACTIVITY_LIMIT:][::-1]:
+        if item.success:
+            table.add_row(Text("✓", style="status.ok"), Text(item.model_id, style="bold"), Text("", style="muted"))
+        else:
+            table.add_row(Text("✗", style="status.fail"), Text(item.model_id, style="bold"), Text(_truncate(item.reason, 48), style="status.fail"))
+    return Panel(table, title="Recent Activity", border_style="panel.border")
+
+
+def _record_model_completion(state: _ScanDashboardState, scan: CapabilityScan) -> None:
+    status, _ = _scan_status(scan)
+    success = status == "OK"
+    reason = "" if success else _failure_reason(scan)
+    with state.lock:
+        state.results.append(scan)
+        state.completed_models = len(state.results)
+        state.current_scan = scan
+        state.recent.append(_RecentModelResult(scan.model_id, success, reason))
+        state.recent = state.recent[-RECENT_ACTIVITY_LIMIT:]
+
+
+def _scan_model_worker(app: ProviderInspectorApp, state: _ScanDashboardState) -> None:
+    if not app.client:
+        with state.lock:
+            state.error = "Not connected."
+            state.running = False
+        return
+
+    try:
+        for model_index, model in enumerate(session.models, 1):
+            scan = CapabilityScan(model_id=model.id)
+            with state.lock:
+                state.current_model_index = model_index
+                state.current_model_id = model.id
+                state.current_model_owner = model.owner
+                state.current_capability_index = 0
+                state.current_capability_name = ""
+                state.current_scan = scan
+
+            for capability_index, (label, action) in enumerate(CAPABILITY_SEQUENCE, 1):
+                with state.lock:
+                    state.current_capability_index = capability_index
+                    state.current_capability_name = label
+
+                if action == "chat":
+                    scan.chat = test_chat(app.client, model.id)
+                elif action == "streaming":
+                    scan.streaming = test_streaming(app.client, model.id)
+                elif action == "tools":
+                    scan.tools = test_tool_calling(app.client, model.id)
+                elif action == "vision":
+                    scan.vision = test_vision(app.client, model.id)
+                elif action == "json_mode":
+                    scan.json_mode = test_json_mode(app.client, model.id)
+
+                with state.lock:
+                    state.completed_capabilities += 1
+                    state.current_scan = scan
+
+            _record_model_completion(state, scan)
+
+    except Exception as exc:  # noqa: BLE001
+        with state.lock:
+            state.error = str(exc)
+    finally:
+        with state.lock:
+            state.running = False
+            if not state.current_model_id and session.models:
+                state.current_model_index = 1
+                state.current_model_id = session.models[0].id
+                state.current_model_owner = session.models[0].owner
+
+
+def _render_scan_dashboard(state: _ScanDashboardState) -> Layout:
+    layout = Layout()
+    layout.split_column(
+        Layout(name="title", size=5),
+        Layout(name="summary", size=8),
+        Layout(name="progress", size=9),
+        Layout(name="recent", ratio=1),
+    )
+
+    current_model = state.current_model_id or "Starting…"
+    owner = state.current_model_owner
+    capability = state.current_capability_name or "Preparing"
+    total_models = state.total_models
+    model_progress = f"Model {state.completed_models} / {total_models}" if total_models else "Model 0 / 0"
+    capability_progress = f"Capability: {capability} ({state.completed_capabilities % 5 + 1} / 5)" if state.current_capability_name else "Capability: Preparing"
+    elapsed = _format_elapsed(time.monotonic() - state.started_at)
+    spinner = _spinner_frame() if state.running else ""
+
+    title = Table.grid(padding=(0, 1))
+    title.add_column()
+    title.add_row(Text("Full Capability Scan", style="bold white"))
+    title.add_row(Text("Live dashboard", style="muted"))
+    layout["title"].update(Panel(title, border_style="panel.border"))
+
+    summary = Table.grid(padding=(0, 1))
+    summary.add_column(style="muted", no_wrap=True)
+    summary.add_column()
+    summary.add_row("Current Model", Text(current_model, style="bold white"))
+    if owner:
+        summary.add_row("Owner", Text(owner, style="muted"))
+    summary.add_row("Current Capability", Text(capability, style="bold"))
+    summary.add_row("Status", Text(f"{spinner} Testing…" if state.running else "Done", style="status.active" if state.running else "status.ok"))
+    layout["summary"].update(Panel(summary, border_style="panel.border"))
+
+    progress = Progress(
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=None),
+        TextColumn("{task.percentage:>3.0f}%"),
+        expand=True,
+    )
+    task = progress.add_task("", total=100)
+    percent = 0
+    if total_models:
+        percent = int((state.completed_models / total_models) * 100)
+    progress.update(task, completed=percent, description=model_progress)
+    progress_group = Table.grid(expand=True)
+    progress_group.add_column()
+    progress_group.add_row(progress)
+    progress_group.add_row(Text(capability_progress, style="muted"))
+    progress_group.add_row(Text(f"Elapsed: {elapsed}", style="muted"))
+    layout["progress"].update(Panel(progress_group, border_style="panel.border"))
+
+    recent_tbl = Table(show_header=False, box=box.SIMPLE, expand=True, padding=(0, 1))
+    recent_tbl.add_column("Status", width=3)
+    recent_tbl.add_column("Model", overflow="ellipsis")
+    recent_tbl.add_column("Detail", overflow="ellipsis")
+    for entry in state.recent[-RECENT_ACTIVITY_LIMIT:]:
+        icon = "✓" if entry.success else "✗"
+        detail = entry.reason
+        recent_tbl.add_row(icon, entry.model_id, detail)
+    if not state.recent:
+        recent_tbl.add_row("•", "", "Waiting for first result")
+    layout["recent"].update(Panel(recent_tbl, title="Recent Activity", border_style="panel.border"))
+    return layout
 
 
 def _render_scan_progress(model: str, capability: str, done: int, total: int, elapsed_ms: float, console_width: int) -> Panel:
@@ -701,43 +1074,26 @@ def _full_scan(app: ProviderInspectorApp) -> str:
             return "exit"
         return "back"
 
-    total_models = len(session.models)
-    results: list[CapabilityScan] = []
-    app.console.print()
+    state = _ScanDashboardState(total_models=len(session.models))
+    worker = threading.Thread(target=_scan_model_worker, args=(app, state), daemon=True)
+    worker.start()
 
-    with Live(
-        _render_scan_progress("Starting…", "Preparing", 0, total_models * 5, 0.0, app.console.width),
-        console=app.console,
-        refresh_per_second=12,
-        transient=True,
-    ) as live:
-        done = 0
-        start = datetime.now().timestamp() * 1000
-        for model in session.models:
-            scan = CapabilityScan(model_id=model.id)
-            for capability, action in [
-                ("Chat", "chat"),
-                ("Stream", "streaming"),
-                ("Tools", "tools"),
-                ("Vision", "vision"),
-                ("JSON", "json"),
-            ]:
-                elapsed = (datetime.now().timestamp() * 1000) - start
-                live.update(_render_scan_progress(model.id, capability, done, total_models * 5, elapsed, app.console.width))
-                if action == "chat":
-                    scan.chat = test_chat(app.client, model.id)
-                elif action == "streaming":
-                    scan.streaming = test_streaming(app.client, model.id)
-                elif action == "tools":
-                    scan.tools = test_tool_calling(app.client, model.id)
-                elif action == "vision":
-                    scan.vision = test_vision(app.client, model.id)
-                elif action == "json":
-                    scan.json_mode = test_json_mode(app.client, model.id)
-                done += 1
-            results.append(scan)
-            elapsed = (datetime.now().timestamp() * 1000) - start
-            live.update(_render_scan_progress(model.id, "Done", done, total_models * 5, elapsed, app.console.width))
+    with Live(_scan_progress_layout(state, app.console.width), console=app.console, refresh_per_second=4, transient=True) as live:
+        while worker.is_alive():
+            time.sleep(1)
+            live.update(_scan_progress_layout(state, app.console.width))
+        worker.join()
+        live.update(_scan_progress_layout(state, app.console.width))
+
+    with state.lock:
+        if state.error:
+            app.console.print(Panel(state.error, title="Scan Error", border_style="red"))
+            _nav(app.console)
+            choice = _ask()
+            if choice == "q":
+                return "exit"
+            return "back"
+        results = list(state.results)
 
     session.scan_results = results
     app.scan_results = results

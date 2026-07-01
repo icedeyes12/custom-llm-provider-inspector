@@ -17,6 +17,9 @@ PALETTE = Theme(
         "table.header": "bold bright_white",
         "status.ok": "bold green",
         "status.fail": "bold red",
+        "status.partial": "bold yellow",
+        "status.active": "bold cyan",
+        "status.pending": "dim white",
     }
 )
 
